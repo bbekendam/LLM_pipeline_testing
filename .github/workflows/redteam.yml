@@ -77,20 +77,14 @@ jobs:
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
           REPORT_STEM="reports/redteam-${TIMESTAMP}"
  
+          # promptfoo infers format from the file extension — no --output-format flag needed.
+          # Passing both paths to -o writes both formats in a single eval run.
           promptfoo eval \
             --config redteam-tests.yaml \
-            --output "${REPORT_STEM}.json" \
-            --output-format json \
+            -o "${REPORT_STEM}.json" "${REPORT_STEM}.html" \
             --no-cache \
+            --no-progress-bar \
             --max-concurrency 5
- 
-          # Also export a human-readable HTML report
-          promptfoo eval \
-            --config redteam-tests.yaml \
-            --output "${REPORT_STEM}.html" \
-            --output-format html \
-            --no-cache \
-            --max-concurrency 5 || true   # Non-fatal if HTML fails
  
           echo "REPORT_STEM=${REPORT_STEM}" >> $GITHUB_ENV
         env:
@@ -123,4 +117,3 @@ jobs:
           name: redteam-report-${{ github.run_id }}
           path: reports/
           retention-days: 30
- 
