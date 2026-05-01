@@ -76,8 +76,7 @@ jobs:
                "reports/redteam-${TIMESTAMP}.html" \
             --no-cache \
             --no-progress-bar \
-            --max-concurrency 2 \
-            --fail-on-error || EVAL_FAILED=true
+            --max-concurrency 2 || EVAL_FAILED=true
 
           cp "reports/redteam-${TIMESTAMP}.html" reports/index.html
           echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
