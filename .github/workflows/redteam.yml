@@ -1,115 +1,129 @@
 name: PromptFoo RedTeam Scan
- 
+
 on:
   push:
     branches:
-      - '**'          # Trigger on push to ANY branch
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
- 
+      - '**'
+  workflow_dispatch:
+
 permissions:
-  contents: write     # Required to commit reports back to the repo
- 
+  contents: write
+
 jobs:
   redteam:
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # Ollama model pulls can be slow
- 
+    timeout-minutes: 120   # mistral + llama3 pulls add time
+
     env:
-      MODEL_NAME: llama3
       PROMPTFOO_DISABLE_TELEMETRY: 1
       OLLAMA_HOST: http://127.0.0.1:11434
- 
+
     steps:
-      # ──────────────────────────────────────────────
-      # 1. Check out the repository
-      # ──────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
- 
+
       # ──────────────────────────────────────────────
-      # 2. Install & start Ollama
+      # Ollama — install, start, pull BOTH models
+      # llama3   = target under test
+      # mistral  = independent LLM-as-judge grader
       # ──────────────────────────────────────────────
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
- 
+
       - name: Start Ollama service
         run: |
           ollama serve &
-          # Wait until the API is accepting connections
-          echo "Waiting for Ollama to start..."
+          echo "Waiting for Ollama..."
           for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:11434/ > /dev/null 2>&1; then
-              echo "Ollama is up."
-              break
-            fi
+            curl -sf http://127.0.0.1:11434/ > /dev/null 2>&1 && echo "Ollama up." && break
             sleep 2
           done
- 
-      - name: Pull llama3 model
-        run: ollama pull $MODEL_NAME
- 
+
+      - name: Pull target model (llama3)
+        run: ollama pull llama3
+
+      - name: Pull grader model (mistral)
+        run: ollama pull mistral
+
       # ──────────────────────────────────────────────
-      # 3. Install Node.js & promptfoo
+      # Node + promptfoo
       # ──────────────────────────────────────────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
- 
+
       - name: Install promptfoo
         run: npm install -g promptfoo
- 
+
       # ──────────────────────────────────────────────
-      # 4. Run the red-team scan
+      # Generate adversarial test cases
       # ──────────────────────────────────────────────
       - name: Generate red-team test cases
         run: |
           promptfoo redteam generate \
             --config redteam.yaml \
             --output redteam-tests.yaml
-        env:
-          MODEL_NAME: ${{ env.MODEL_NAME }}
- 
+
+      # ──────────────────────────────────────────────
+      # Run evaluation — both JSON and HTML in one pass
+      # --share publishes to promptfoo cloud for the
+      # interactive NIST/OWASP heatmap web UI
+      # ──────────────────────────────────────────────
       - name: Run red-team evaluation
         run: |
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
           REPORT_STEM="reports/redteam-${TIMESTAMP}"
- 
-          # promptfoo infers format from the file extension — no --output-format flag needed.
-          # Passing both paths to -o writes both formats in a single eval run.
+          mkdir -p reports
+
           promptfoo eval \
             --config redteam-tests.yaml \
             -o "${REPORT_STEM}.json" "${REPORT_STEM}.html" \
             --no-cache \
             --no-progress-bar \
-            --max-concurrency 5
- 
+            --max-concurrency 5 \
+            --share 2>&1 | tee /tmp/eval-output.txt
+
+          # Extract and save the shareable URL if one was generated
+          SHARE_URL=$(grep -oP 'https://app\.promptfoo\.dev/\S+' /tmp/eval-output.txt | head -1 || true)
+          if [ -n "$SHARE_URL" ]; then
+            echo "## Red Team Report" > reports/LATEST_REPORT.md
+            echo "Run: ${TIMESTAMP}" >> reports/LATEST_REPORT.md
+            echo "Interactive report (NIST/OWASP heatmap): ${SHARE_URL}" >> reports/LATEST_REPORT.md
+            echo "SHARE_URL=${SHARE_URL}" >> $GITHUB_ENV
+          fi
+
           echo "REPORT_STEM=${REPORT_STEM}" >> $GITHUB_ENV
-        env:
-          MODEL_NAME: ${{ env.MODEL_NAME }}
- 
+
       # ──────────────────────────────────────────────
-      # 5. Commit & push the reports back to the repo
+      # Post the shareable URL to the Actions summary page
+      # ──────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## 🛡️ RedTeam Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${SHARE_URL}" ]; then
+            echo "**Interactive report (NIST/OWASP heatmap):** ${SHARE_URL}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Local reports committed to:** \`reports/\`" >> $GITHUB_STEP_SUMMARY
+
+      # ──────────────────────────────────────────────
+      # Commit reports back to repo
       # ──────────────────────────────────────────────
       - name: Commit reports to repository
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
- 
           git add reports/
-          git diff --cached --quiet && echo "No new reports to commit." && exit 0
- 
-          git commit -m "chore: add redteam report $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
+          git diff --cached --quiet && echo "No new reports." && exit 0
+          git commit -m "chore: redteam report $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
- 
-      # ──────────────────────────────────────────────
-      # 6. Upload reports as a GitHub Actions artifact
-      #    (available even if the commit step fails)
-      # ──────────────────────────────────────────────
+
       - name: Upload report artifact
         if: always()
         uses: actions/upload-artifact@v4
