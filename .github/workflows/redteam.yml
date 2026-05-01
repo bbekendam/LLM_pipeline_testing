@@ -8,15 +8,19 @@ on:
 
 permissions:
   contents: write
+  pages: write        # needed to deploy to GitHub Pages
+  id-token: write     # needed by the pages deploy action
 
 jobs:
   redteam:
     runs-on: ubuntu-latest
-    timeout-minutes: 120   # mistral + llama3 pulls add time
+    timeout-minutes: 120
 
     env:
       PROMPTFOO_DISABLE_TELEMETRY: 1
       OLLAMA_HOST: http://127.0.0.1:11434
+      TARGET_MODEL: llama3
+      GRADER_MODEL: llama3.2:3b
 
     steps:
       - name: Checkout repository
@@ -24,11 +28,14 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ──────────────────────────────────────────────
-      # Ollama — install, start, pull BOTH models
-      # llama3   = target under test
-      # mistral  = independent LLM-as-judge grader
-      # ──────────────────────────────────────────────
+      # ── Cache Ollama models (avoids re-downloading 6.7 GB on every run) ──
+      - name: Cache Ollama models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ env.TARGET_MODEL }}-${{ env.GRADER_MODEL }}
+
+      # ── Ollama ─────────────────────────────────────────────────────────────
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
@@ -41,15 +48,13 @@ jobs:
             sleep 2
           done
 
-      - name: Pull target model (llama3)
-        run: ollama pull llama3
+      - name: Pull target model (${{ env.TARGET_MODEL }})
+        run: ollama pull $TARGET_MODEL
 
-      - name: Pull grader model (mistral)
-        run: ollama pull mistral
+      - name: Pull grader model (${{ env.GRADER_MODEL }})
+        run: ollama pull $GRADER_MODEL
 
-      # ──────────────────────────────────────────────
-      # Node + promptfoo
-      # ──────────────────────────────────────────────
+      # ── Node + promptfoo ───────────────────────────────────────────────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -58,72 +63,121 @@ jobs:
       - name: Install promptfoo
         run: npm install -g promptfoo
 
-      # ──────────────────────────────────────────────
-      # Generate adversarial test cases
-      # ──────────────────────────────────────────────
+      # ── Generate adversarial tests ─────────────────────────────────────────
       - name: Generate red-team test cases
         run: |
           promptfoo redteam generate \
             --config redteam.yaml \
             --output redteam-tests.yaml
 
-      # ──────────────────────────────────────────────
-      # Run evaluation — both JSON and HTML in one pass
-      # --share publishes to promptfoo cloud for the
-      # interactive NIST/OWASP heatmap web UI
-      # ──────────────────────────────────────────────
+      # ── Run evaluation ─────────────────────────────────────────────────────
+      # No --share. HTML is self-contained (all JS/CSS embedded).
+      # JSON is for archival / further analysis.
       - name: Run red-team evaluation
         run: |
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
-          REPORT_STEM="reports/redteam-${TIMESTAMP}"
           mkdir -p reports
 
           promptfoo eval \
             --config redteam-tests.yaml \
-            -o "${REPORT_STEM}.json" "${REPORT_STEM}.html" \
+            -o "reports/redteam-${TIMESTAMP}.json" \
+               "reports/redteam-${TIMESTAMP}.html" \
             --no-cache \
             --no-progress-bar \
-            --max-concurrency 5 \
-            --share 2>&1 | tee /tmp/eval-output.txt
+            --max-concurrency 5
 
-          # Extract and save the shareable URL if one was generated
-          SHARE_URL=$(grep -oP 'https://app\.promptfoo\.dev/\S+' /tmp/eval-output.txt | head -1 || true)
-          if [ -n "$SHARE_URL" ]; then
-            echo "## Red Team Report" > reports/LATEST_REPORT.md
-            echo "Run: ${TIMESTAMP}" >> reports/LATEST_REPORT.md
-            echo "Interactive report (NIST/OWASP heatmap): ${SHARE_URL}" >> reports/LATEST_REPORT.md
-            echo "SHARE_URL=${SHARE_URL}" >> $GITHUB_ENV
-          fi
+          # Keep a stable filename that GitHub Pages always serves as "latest"
+          cp "reports/redteam-${TIMESTAMP}.html" reports/index.html
 
-          echo "REPORT_STEM=${REPORT_STEM}" >> $GITHUB_ENV
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
 
-      # ──────────────────────────────────────────────
-      # Post the shareable URL to the Actions summary page
-      # ──────────────────────────────────────────────
-      - name: Write job summary
-        if: always()
+      # ── Build a simple index listing all past reports ──────────────────────
+      - name: Build reports index page
         run: |
-          echo "## 🛡️ RedTeam Scan Complete" >> $GITHUB_STEP_SUMMARY
-          echo "**Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY
-          if [ -n "${SHARE_URL}" ]; then
-            echo "**Interactive report (NIST/OWASP heatmap):** ${SHARE_URL}" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "**Local reports committed to:** \`reports/\`" >> $GITHUB_STEP_SUMMARY
+          python3 - << 'EOF'
+          import os, glob, json
 
-      # ──────────────────────────────────────────────
-      # Commit reports back to repo
-      # ──────────────────────────────────────────────
+          reports = sorted(glob.glob("reports/redteam-*.json"), reverse=True)
+          rows = []
+          for rpt in reports[:20]:          # show last 20
+              ts = os.path.basename(rpt).replace("redteam-","").replace(".json","")
+              html_file = rpt.replace(".json",".html")
+              html_name = os.path.basename(html_file)
+              # try to read pass/fail counts
+              try:
+                  with open(rpt) as f:
+                      d = json.load(f)
+                  res = d.get("results",{}).get("results",[])
+                  passed = sum(1 for r in res if r.get("success"))
+                  total  = len(res)
+                  badge  = f'<span style="color:{"green" if passed==total else "red"}">{passed}/{total} passed</span>'
+              except Exception:
+                  badge = "—"
+              rows.append(f'<tr><td>{ts}</td><td>{badge}</td>'
+                          f'<td><a href="{html_name}">view report</a></td>'
+                          f'<td><a href="{os.path.basename(rpt)}">json</a></td></tr>')
+
+          html = f"""<!DOCTYPE html>
+          <html><head><meta charset="utf-8">
+          <title>AEGIS RedTeam Reports</title>
+          <style>
+            body{{font-family:sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem}}
+            h1{{color:#1a1a2e}} table{{width:100%;border-collapse:collapse}}
+            th,td{{padding:.6rem 1rem;border:1px solid #ddd;text-align:left}}
+            th{{background:#1a1a2e;color:#fff}} tr:nth-child(even){{background:#f5f5f5}}
+            a{{color:#0066cc}}
+          </style></head>
+          <body>
+          <h1>🛡️ AEGIS RedTeam Report History</h1>
+          <p><a href="index.html">← Latest scan</a></p>
+          <table><tr><th>Run</th><th>Result</th><th>HTML Report</th><th>Raw JSON</th></tr>
+          {''.join(rows) if rows else '<tr><td colspan=4>No reports yet</td></tr>'}
+          </table></body></html>"""
+
+          with open("reports/history.html","w") as f:
+              f.write(html)
+          print("Index written.")
+          EOF
+
+      # ── Commit JSON + HTML reports back to the repo ───────────────────────
       - name: Commit reports to repository
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add reports/
           git diff --cached --quiet && echo "No new reports." && exit 0
-          git commit -m "chore: redteam report $(date -u +'%Y-%m-%d %H:%M UTC') [skip ci]"
+          git commit -m "chore: redteam report $TIMESTAMP [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── Deploy reports/ to GitHub Pages ───────────────────────────────────
+      # Free, self-hosted inside your GitHub account.
+      # URL: https://<your-org>.github.io/<repo-name>/
+      # For private repos: only collaborators with repo access can view it.
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: reports/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # ── Job summary (links to your own Pages URL, not promptfoo cloud) ────
+      - name: Write job summary
+        if: always()
+        run: |
+          PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          echo "## 🛡️ RedTeam Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target** | \`$TARGET_MODEL\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Grader** | \`$GRADER_MODEL\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Latest report** | [${PAGES_URL}](${PAGES_URL}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Report history** | [${PAGES_URL}/history.html](${PAGES_URL}/history.html) |" >> $GITHUB_STEP_SUMMARY
+
+      # ── Artifact backup (also free, 30-day retention) ─────────────────────
       - name: Upload report artifact
         if: always()
         uses: actions/upload-artifact@v4
