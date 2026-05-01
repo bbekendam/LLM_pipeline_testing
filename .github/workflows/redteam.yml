@@ -19,9 +19,8 @@ jobs:
     env:
       PROMPTFOO_DISABLE_TELEMETRY: 1
       OLLAMA_HOST: http://127.0.0.1:11434
-      # llama3.2:1b — 1.3 GB, single model for target + grader
-      # ~10-15 sec/test on 2-core CPU vs ~4 min for llama3 8B
       MODEL: llama3.2:1b
+      NODE_NO_WARNINGS: 1
 
     steps:
       - name: Checkout repository
@@ -35,6 +34,7 @@ jobs:
           path: ~/.ollama/models
           key: ollama-${{ env.MODEL }}
 
+      # ── Ollama ─────────────────────────────────────────────────────────────
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
@@ -47,41 +47,83 @@ jobs:
             sleep 2
           done
 
-      # Single model pull — ~1.3 GB, cached after first run
       - name: Pull model (${{ env.MODEL }})
         run: ollama pull $MODEL
 
+      # ── Node.js (no global install — use npx per promptfoo docs) ───────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'    # promptfoo docs require 20.20+ or 22.22+
 
-      - name: Install promptfoo
-        run: npm install -g promptfoo
-
+      # ── Generate adversarial test cases ────────────────────────────────────
       - name: Generate red-team test cases
         run: |
-          promptfoo redteam generate \
+          npx promptfoo@latest redteam generate \
             --config redteam.yaml \
             --output redteam-tests.yaml
 
+      # ── Run evaluation ──────────────────────────────────────────────────────
       - name: Run red-team evaluation
         run: |
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
           mkdir -p reports
 
-          promptfoo eval \
+          # --fail-on-error: exits non-zero if any test fails → blocks the pipeline
+          npx promptfoo@latest eval \
             --config redteam-tests.yaml \
             -o "reports/redteam-${TIMESTAMP}.json" \
                "reports/redteam-${TIMESTAMP}.html" \
             --no-cache \
             --no-progress-bar \
-            --max-concurrency 2
+            --max-concurrency 2 \
+            --fail-on-error || EVAL_FAILED=true
 
           cp "reports/redteam-${TIMESTAMP}.html" reports/index.html
           echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
 
+          # Defer the failure so reports are still committed and Pages deployed
+          if [ "$EVAL_FAILED" = "true" ]; then
+            echo "EVAL_FAILED=true" >> $GITHUB_ENV
+          fi
+
+      # ── Quality gate summary ────────────────────────────────────────────────
+      - name: Parse results for quality gate
+        if: always()
+        run: |
+          python3 - << 'EOF'
+          import json, os, glob, sys
+
+          reports = sorted(glob.glob("reports/redteam-*.json"), reverse=True)
+          if not reports:
+              print("No report found.")
+              sys.exit(0)
+
+          with open(reports[0]) as f:
+              data = json.load(f)
+
+          res   = data.get("results", {}).get("results", [])
+          total  = len(res)
+          passed = sum(1 for r in res if r.get("success"))
+          failed = total - passed
+          rate   = (passed / total * 100) if total else 0
+
+          print(f"Total:  {total}")
+          print(f"Passed: {passed}")
+          print(f"Failed: {failed}")
+          print(f"Rate:   {rate:.1f}%")
+
+          # Write to GitHub env for the summary step
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"QG_TOTAL={total}\n")
+              f.write(f"QG_PASSED={passed}\n")
+              f.write(f"QG_FAILED={failed}\n")
+              f.write(f"QG_RATE={rate:.1f}\n")
+          EOF
+
+      # ── Build history index ─────────────────────────────────────────────────
       - name: Build report history index
+        if: always()
         run: |
           python3 - << 'EOF'
           import os, glob, json
@@ -94,11 +136,12 @@ jobs:
               try:
                   with open(rpt) as f:
                       d = json.load(f)
-                  res = d.get("results",{}).get("results",[])
+                  res    = d.get("results",{}).get("results",[])
                   passed = sum(1 for r in res if r.get("success"))
                   total  = len(res)
-                  color  = "green" if passed == total else ("orange" if passed/total > 0.8 else "red")
-                  badge  = f'<span style="color:{color};font-weight:bold">{passed}/{total} passed</span>'
+                  rate   = passed / total * 100 if total else 0
+                  color  = "green" if rate == 100 else ("orange" if rate >= 80 else "red")
+                  badge  = f'<span style="color:{color};font-weight:bold">{passed}/{total} ({rate:.0f}%)</span>'
               except Exception:
                   badge = "—"
               rows.append(
@@ -133,7 +176,9 @@ jobs:
           print(f"Index written — {len(rows)} report(s) listed.")
           EOF
 
+      # ── Commit reports ──────────────────────────────────────────────────────
       - name: Commit reports to repository
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -144,25 +189,37 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── GitHub Pages ────────────────────────────────────────────────────────
       - name: Upload Pages artifact
+        if: always()
         uses: actions/upload-pages-artifact@v3
         with:
           path: reports/
 
       - name: Deploy to GitHub Pages
-        id: deployment
+        if: always()
         uses: actions/deploy-pages@v4
 
+      # ── Job summary ─────────────────────────────────────────────────────────
       - name: Write job summary
         if: always()
         run: |
           PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
-          echo "## 🛡️ RedTeam Scan Complete" >> $GITHUB_STEP_SUMMARY
+          STATUS=$( [ "${EVAL_FAILED}" = "true" ] && echo "❌ FAILED" || echo "✅ PASSED" )
+          echo "## 🛡️ RedTeam Scan — ${STATUS}" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Model** | \`$MODEL\` (target + grader) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Model** | \`$MODEL\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tests** | ${QG_PASSED}/${QG_TOTAL} passed (${QG_RATE}%) |" >> $GITHUB_STEP_SUMMARY
           echo "| **Latest report** | [${PAGES_URL}](${PAGES_URL}) |" >> $GITHUB_STEP_SUMMARY
           echo "| **History** | [${PAGES_URL}/history.html](${PAGES_URL}/history.html) |" >> $GITHUB_STEP_SUMMARY
+
+      # ── Fail the pipeline if tests failed (after reports are saved) ─────────
+      - name: Enforce quality gate
+        if: env.EVAL_FAILED == 'true'
+        run: |
+          echo "❌ Red team evaluation found failures. Review the report before merging."
+          exit 1
 
       - name: Upload artifact backup
         if: always()
