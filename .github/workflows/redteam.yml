@@ -8,8 +8,8 @@ on:
 
 permissions:
   contents: write
-  pages: write        # needed to deploy to GitHub Pages
-  id-token: write     # needed by the pages deploy action
+  pages: write
+  id-token: write
 
 jobs:
   redteam:
@@ -19,8 +19,9 @@ jobs:
     env:
       PROMPTFOO_DISABLE_TELEMETRY: 1
       OLLAMA_HOST: http://127.0.0.1:11434
-      TARGET_MODEL: llama3
-      GRADER_MODEL: llama3.2:3b
+      # llama3.2:1b — 1.3 GB, single model for target + grader
+      # ~10-15 sec/test on 2-core CPU vs ~4 min for llama3 8B
+      MODEL: llama3.2:1b
 
     steps:
       - name: Checkout repository
@@ -28,14 +29,12 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Cache Ollama models (avoids re-downloading 6.7 GB on every run) ──
       - name: Cache Ollama models
         uses: actions/cache@v4
         with:
           path: ~/.ollama/models
-          key: ollama-${{ env.TARGET_MODEL }}-${{ env.GRADER_MODEL }}
+          key: ollama-${{ env.MODEL }}
 
-      # ── Ollama ─────────────────────────────────────────────────────────────
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
@@ -48,13 +47,10 @@ jobs:
             sleep 2
           done
 
-      - name: Pull target model (${{ env.TARGET_MODEL }})
-        run: ollama pull $TARGET_MODEL
+      # Single model pull — ~1.3 GB, cached after first run
+      - name: Pull model (${{ env.MODEL }})
+        run: ollama pull $MODEL
 
-      - name: Pull grader model (${{ env.GRADER_MODEL }})
-        run: ollama pull $GRADER_MODEL
-
-      # ── Node + promptfoo ───────────────────────────────────────────────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -63,16 +59,12 @@ jobs:
       - name: Install promptfoo
         run: npm install -g promptfoo
 
-      # ── Generate adversarial tests ─────────────────────────────────────────
       - name: Generate red-team test cases
         run: |
           promptfoo redteam generate \
             --config redteam.yaml \
             --output redteam-tests.yaml
 
-      # ── Run evaluation ─────────────────────────────────────────────────────
-      # No --share. HTML is self-contained (all JS/CSS embedded).
-      # JSON is for archival / further analysis.
       - name: Run red-team evaluation
         run: |
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
@@ -84,62 +76,63 @@ jobs:
                "reports/redteam-${TIMESTAMP}.html" \
             --no-cache \
             --no-progress-bar \
-            --max-concurrency 5
+            --max-concurrency 2
 
-          # Keep a stable filename that GitHub Pages always serves as "latest"
           cp "reports/redteam-${TIMESTAMP}.html" reports/index.html
-
           echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
 
-      # ── Build a simple index listing all past reports ──────────────────────
-      - name: Build reports index page
+      - name: Build report history index
         run: |
           python3 - << 'EOF'
           import os, glob, json
 
           reports = sorted(glob.glob("reports/redteam-*.json"), reverse=True)
           rows = []
-          for rpt in reports[:20]:          # show last 20
+          for rpt in reports[:20]:
               ts = os.path.basename(rpt).replace("redteam-","").replace(".json","")
-              html_file = rpt.replace(".json",".html")
-              html_name = os.path.basename(html_file)
-              # try to read pass/fail counts
+              html_name = os.path.basename(rpt.replace(".json",".html"))
               try:
                   with open(rpt) as f:
                       d = json.load(f)
                   res = d.get("results",{}).get("results",[])
                   passed = sum(1 for r in res if r.get("success"))
                   total  = len(res)
-                  badge  = f'<span style="color:{"green" if passed==total else "red"}">{passed}/{total} passed</span>'
+                  color  = "green" if passed == total else ("orange" if passed/total > 0.8 else "red")
+                  badge  = f'<span style="color:{color};font-weight:bold">{passed}/{total} passed</span>'
               except Exception:
                   badge = "—"
-              rows.append(f'<tr><td>{ts}</td><td>{badge}</td>'
-                          f'<td><a href="{html_name}">view report</a></td>'
-                          f'<td><a href="{os.path.basename(rpt)}">json</a></td></tr>')
+              rows.append(
+                  f'<tr><td>{ts}</td><td>{badge}</td>'
+                  f'<td><a href="{html_name}">interactive report</a></td>'
+                  f'<td><a href="{os.path.basename(rpt)}">json</a></td></tr>'
+              )
 
-          html = f"""<!DOCTYPE html>
+          html = """<!DOCTYPE html>
           <html><head><meta charset="utf-8">
           <title>AEGIS RedTeam Reports</title>
           <style>
-            body{{font-family:sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem}}
-            h1{{color:#1a1a2e}} table{{width:100%;border-collapse:collapse}}
-            th,td{{padding:.6rem 1rem;border:1px solid #ddd;text-align:left}}
-            th{{background:#1a1a2e;color:#fff}} tr:nth-child(even){{background:#f5f5f5}}
-            a{{color:#0066cc}}
+            body{font-family:sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem}
+            h1{color:#1a1a2e}
+            table{width:100%;border-collapse:collapse;margin-top:1rem}
+            th,td{padding:.6rem 1rem;border:1px solid #ddd;text-align:left}
+            th{background:#1a1a2e;color:#fff}
+            tr:nth-child(even){background:#f5f5f5}
+            a{color:#0066cc}
+            .latest{margin:1rem 0;padding:1rem;background:#e8f4fd;border-radius:6px}
           </style></head>
           <body>
           <h1>🛡️ AEGIS RedTeam Report History</h1>
-          <p><a href="index.html">← Latest scan</a></p>
-          <table><tr><th>Run</th><th>Result</th><th>HTML Report</th><th>Raw JSON</th></tr>
-          {''.join(rows) if rows else '<tr><td colspan=4>No reports yet</td></tr>'}
+          <div class="latest"><a href="index.html">▶ View latest scan (interactive NIST/OWASP heatmap)</a></div>
+          <table>
+            <tr><th>Run timestamp</th><th>Result</th><th>Interactive report</th><th>Raw JSON</th></tr>
+          """ + ("".join(rows) if rows else "<tr><td colspan=4>No reports yet</td></tr>") + """
           </table></body></html>"""
 
           with open("reports/history.html","w") as f:
               f.write(html)
-          print("Index written.")
+          print(f"Index written — {len(rows)} report(s) listed.")
           EOF
 
-      # ── Commit JSON + HTML reports back to the repo ───────────────────────
       - name: Commit reports to repository
         run: |
           git config user.name  "github-actions[bot]"
@@ -151,10 +144,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Deploy reports/ to GitHub Pages ───────────────────────────────────
-      # Free, self-hosted inside your GitHub account.
-      # URL: https://<your-org>.github.io/<repo-name>/
-      # For private repos: only collaborators with repo access can view it.
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -164,7 +153,6 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
-      # ── Job summary (links to your own Pages URL, not promptfoo cloud) ────
       - name: Write job summary
         if: always()
         run: |
@@ -172,13 +160,11 @@ jobs:
           echo "## 🛡️ RedTeam Scan Complete" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Target** | \`$TARGET_MODEL\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Grader** | \`$GRADER_MODEL\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Model** | \`$MODEL\` (target + grader) |" >> $GITHUB_STEP_SUMMARY
           echo "| **Latest report** | [${PAGES_URL}](${PAGES_URL}) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Report history** | [${PAGES_URL}/history.html](${PAGES_URL}/history.html) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **History** | [${PAGES_URL}/history.html](${PAGES_URL}/history.html) |" >> $GITHUB_STEP_SUMMARY
 
-      # ── Artifact backup (also free, 30-day retention) ─────────────────────
-      - name: Upload report artifact
+      - name: Upload artifact backup
         if: always()
         uses: actions/upload-artifact@v4
         with:
