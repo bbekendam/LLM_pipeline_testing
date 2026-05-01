@@ -1,0 +1,10 @@
+# promptfoo working files
+redteam-tests.yaml
+.promptfoo/
+ 
+# Node
+node_modules/
+ 
+# OS
+.DS_Store
+ 
