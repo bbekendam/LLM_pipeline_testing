@@ -19,7 +19,7 @@ jobs:
     env:
       PROMPTFOO_DISABLE_TELEMETRY: 1
       OLLAMA_HOST: http://127.0.0.1:11434
-      MODEL: llama3.2:1b
+      MODEL: github:meta/llama-4-scout
       NODE_NO_WARNINGS: 1
 
     steps:
@@ -27,28 +27,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cache Ollama models
-        uses: actions/cache@v4
-        with:
-          path: ~/.ollama/models
-          key: ollama-${{ env.MODEL }}
-
-      # ── Ollama ─────────────────────────────────────────────────────────────
-      - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
-
-      - name: Start Ollama service
-        run: |
-          ollama serve &
-          echo "Waiting for Ollama..."
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:11434/ > /dev/null 2>&1 && echo "Ollama up." && break
-            sleep 2
-          done
-
-      - name: Pull model (${{ env.MODEL }})
-        run: ollama pull $MODEL
 
       # ── Node.js (no global install — use npx per promptfoo docs) ───────────
       - name: Set up Node.js
