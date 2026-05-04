@@ -41,7 +41,7 @@ redteam:
   strategies:
     - id: basic  # Original plugin tests without any additional strategies or optimizations
   numTests: 3
-  maxConcurrency: 20
+  maxConcurrency: 3
 
 
   # This tells the test generator how to behave when creating the attacks
