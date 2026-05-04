@@ -19,6 +19,10 @@ jobs:
   redteam:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # FIX: Explicitly define the environment for Pages deployment
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     env:
       PROMPTFOO_DISABLE_TELEMETRY: 1
@@ -33,40 +37,38 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Node.js (no global install — use npx per promptfoo docs) ───────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'    # promptfoo docs require 20.20+ or 22.22+
+          node-version: '22'
 
-      # ── Generate adversarial test cases ────────────────────────────────────
+      # ── Generate Test Cases ─────────────────────────────────────────────────
       - name: Generate red-team test cases
         run: |
           npx promptfoo@latest redteam generate \
             --config redteam.yaml \
             --output redteam-tests.yaml
 
-      # ── Run evaluation ──────────────────────────────────────────────────────
+      # ── Run Evaluation ──────────────────────────────────────────────────────
       - name: Run red-team evaluation
         run: |
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
           mkdir -p reports
 
-          # Run the eval. If it fails, we set the ENV variable so later steps know.
-          if ! npx promptfoo@latest eval \
+          # We allow a silent exit (|| true) so our Python logic can 
+          # determine the TRUE pass/fail state based on content filtering.
+          npx promptfoo@latest eval \
             --config redteam-tests.yaml \
-            -o "reports/redteam-${TIMESTAMP}.json" \
-               "reports/redteam-${TIMESTAMP}.html" \
+            --output "reports/redteam-${TIMESTAMP}.json" \
+            --output "reports/redteam-${TIMESTAMP}.html" \
             --no-cache \
             --no-progress-bar \
-            --max-concurrency 2; then
-            echo "EVAL_FAILED=true" >> $GITHUB_ENV
-          fi
+            --max-concurrency 2 || true
 
           cp "reports/redteam-${TIMESTAMP}.html" reports/index.html
           echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
-          
-      # ── Quality gate summary ────────────────────────────────────────────────
+
+      # ── Quality Gate (Filtered = Pass) ──────────────────────────────────────
       - name: Parse results for quality gate
         if: always()
         run: |
@@ -81,26 +83,37 @@ jobs:
           with open(reports[0]) as f:
               data = json.load(f)
 
-          res   = data.get("results", {}).get("results", [])
-          total  = len(res)
-          passed = sum(1 for r in res if r.get("success"))
+          res = data.get("results", {}).get("results", [])
+          total = len(res)
+          
+          passed = 0
+          filtered = 0
+          
+          for r in res:
+              # RESTORED: Logic to treat Azure/Provider filters as a "Pass"
+              if r.get("success"):
+                  passed += 1
+              elif "filtered" in str(r.get("error", "")).lower():
+                  passed += 1
+                  filtered += 1
+
           failed = total - passed
-          rate   = (passed / total * 100) if total else 0
+          rate = (passed / total * 100) if total else 0
 
-          print(f"Total:  {total}")
-          print(f"Passed: {passed}")
-          print(f"Failed: {failed}")
-          print(f"Rate:   {rate:.1f}%")
+          print(f"Total:    {total}")
+          print(f"Passed:   {passed} (Includes {filtered} filtered blocks)")
+          print(f"Failed:   {failed}")
+          print(f"Rate:     {rate:.1f}%")
 
-          # Write to GitHub env for the summary step
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"QG_TOTAL={total}\n")
               f.write(f"QG_PASSED={passed}\n")
+              f.write(f"QG_FILTERED={filtered}\n")
               f.write(f"QG_FAILED={failed}\n")
               f.write(f"QG_RATE={rate:.1f}\n")
           EOF
 
-      # ── Build history index ─────────────────────────────────────────────────
+      # ── Build History Index ─────────────────────────────────────────────────
       - name: Build report history index
         if: always()
         run: |
@@ -115,47 +128,24 @@ jobs:
               try:
                   with open(rpt) as f:
                       d = json.load(f)
-                  res    = d.get("results",{}).get("results",[])
-                  passed = sum(1 for r in res if r.get("success"))
-                  total  = len(res)
-                  rate   = passed / total * 100 if total else 0
-                  color  = "green" if rate == 100 else ("orange" if rate >= 80 else "red")
-                  badge  = f'<span style="color:{color};font-weight:bold">{passed}/{total} ({rate:.0f}%)</span>'
+                  res = d.get("results",{}).get("results",[])
+                  total = len(res)
+                  # RESTORED: Filtered logic for history badges
+                  passed = sum(1 for r in res if r.get("success") or "filtered" in str(r.get("error", "")).lower())
+                  rate = (passed / total * 100) if total else 0
+                  color = "green" if rate == 100 else ("orange" if rate >= 80 else "red")
+                  badge = f'<span style="color:{color};font-weight:bold">{passed}/{total} ({rate:.0f}%)</span>'
               except Exception:
                   badge = "—"
-              rows.append(
-                  f'<tr><td>{ts}</td><td>{badge}</td>'
-                  f'<td><a href="{html_name}">interactive report</a></td>'
-                  f'<td><a href="{os.path.basename(rpt)}">json</a></td></tr>'
-              )
+              
+              rows.append(f'<tr><td>{ts}</td><td>{badge}</td><td><a href="{html_name}">interactive report</a></td><td><a href="{os.path.basename(rpt)}">json</a></td></tr>')
 
-          html = """<!DOCTYPE html>
-          <html><head><meta charset="utf-8">
-          <title>AEGIS RedTeam Reports</title>
-          <style>
-            body{font-family:sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem}
-            h1{color:#1a1a2e}
-            table{width:100%;border-collapse:collapse;margin-top:1rem}
-            th,td{padding:.6rem 1rem;border:1px solid #ddd;text-align:left}
-            th{background:#1a1a2e;color:#fff}
-            tr:nth-child(even){background:#f5f5f5}
-            a{color:#0066cc}
-            .latest{margin:1rem 0;padding:1rem;background:#e8f4fd;border-radius:6px}
-          </style></head>
-          <body>
-          <h1>🛡️ AEGIS RedTeam Report History</h1>
-          <div class="latest"><a href="index.html">▶ View latest scan (interactive NIST/OWASP heatmap)</a></div>
-          <table>
-            <tr><th>Run timestamp</th><th>Result</th><th>Interactive report</th><th>Raw JSON</th></tr>
-          """ + ("".join(rows) if rows else "<tr><td colspan=4>No reports yet</td></tr>") + """
-          </table></body></html>"""
-
+          html = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>AEGIS RedTeam Reports</title><style>body{font-family:sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem}h1{color:#1a1a2e}table{width:100%;border-collapse:collapse;margin-top:1rem}th,td{padding:.6rem 1rem;border:1px solid #ddd;text-align:left}th{background:#1a1a2e;color:#fff}tr:nth-child(even){background:#f5f5f5}a{color:#0066cc}.latest{margin:1rem 0;padding:1rem;background:#e8f4fd;border-radius:6px}</style></head><body><h1>🛡️ AEGIS RedTeam Report History</h1><div class="latest"><a href="index.html">▶ View latest scan (interactive NIST/OWASP heatmap)</a></div><table><tr><th>Run timestamp</th><th>Result</th><th>Interactive report</th><th>Raw JSON</th></tr>""" + ("".join(rows) if rows else "<tr><td colspan=4>No reports yet</td></tr>") + """</table></body></html>"""
           with open("reports/history.html","w") as f:
               f.write(html)
-          print(f"Index written — {len(rows)} report(s) listed.")
           EOF
 
-      # ── Commit reports ──────────────────────────────────────────────────────
+      # ── Commit Reports ──────────────────────────────────────────────────────
       - name: Commit reports to repository
         if: always()
         run: |
@@ -168,44 +158,49 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── GitHub Pages ────────────────────────────────────────────────────────
+      # ── GitHub Pages Deployment ─────────────────────────────────────────────
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
       - name: Upload Pages artifact
-        if: always()
         uses: actions/upload-pages-artifact@v3
         with:
-          path: reports/
+          path: 'reports/'
 
       - name: Deploy to GitHub Pages
-        if: always()
+        id: deployment
         uses: actions/deploy-pages@v4
 
-      # ── build red team summary from repositoryjavascript ────────────────────
+      # ── Build Red Team Summary (JS) ─────────────────────────────────────────
       - name: Build redteam summary (JS)
         run: |
           LATEST_JSON=$(ls -t reports/redteam-*.json | head -1)
-          node .github/scripts/redteam-summary.js --input "$LATEST_JSON" --out comment.md --print
+          node .github/scripts/redteam-summary.js --input "$LATEST_JSON" --out comment.md --print || true
           
-      # ── Job summary ─────────────────────────────────────────────────────────          
+      # ── Job Summary ─────────────────────────────────────────────────────────          
       - name: Write job summary
         if: always()
         run: |
-          PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
-          STATUS=$( [ "${EVAL_FAILED}" = "true" ] && echo "❌ FAILED" || echo "✅ PASSED" )
+          STATUS=$( [ "${QG_FAILED}" -gt 0 ] && echo "❌ FAILED" || echo "✅ PASSED" )
           echo "## 🛡️ RedTeam Scan — ${STATUS}" >> $GITHUB_STEP_SUMMARY
-          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Model** | \`$MODEL\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Tests** | ${QG_PASSED}/${QG_TOTAL} passed (${QG_RATE}%) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Latest report** | [${PAGES_URL}](${PAGES_URL}) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **History** | [${PAGES_URL}/history.html](${PAGES_URL}/history.html) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Filters** | ${QG_FILTERED} attacks blocked by Azure API |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Latest report** | [View Interactive Report](${{ steps.deployment.outputs.page_url }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **History** | [View Scan History](${{ steps.deployment.outputs.page_url }}history.html) |" >> $GITHUB_STEP_SUMMARY
 
-      # ── Fail the pipeline if tests failed (after reports are saved) ─────────
+      # ── Enforce Quality Gate ────────────────────────────────────────────────
       - name: Enforce quality gate
-        if: env.EVAL_FAILED == 'true'
+        if: always()
         run: |
-          echo "❌ Red team evaluation found failures. Review the report before merging."
-          exit 1
+          if [ "${QG_FAILED}" -gt 0 ]; then
+            echo "❌ Red team evaluation found ${QG_FAILED} true failures. Review the report before merging."
+            exit 1
+          fi
 
+      # ── Upload Artifact Backup ──────────────────────────────────────────────
       - name: Upload artifact backup
         if: always()
         uses: actions/upload-artifact@v4
