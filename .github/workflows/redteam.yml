@@ -1,5 +1,9 @@
 name: PromptFoo RedTeam Scan
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+  
 on:
   push:
     branches:
@@ -48,23 +52,20 @@ jobs:
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
           mkdir -p reports
 
-          # --fail-on-error: exits non-zero if any test fails → blocks the pipeline
-          npx promptfoo@latest eval \
+          # Run the eval. If it fails, we set the ENV variable so later steps know.
+          if ! npx promptfoo@latest eval \
             --config redteam-tests.yaml \
             -o "reports/redteam-${TIMESTAMP}.json" \
                "reports/redteam-${TIMESTAMP}.html" \
             --no-cache \
             --no-progress-bar \
-            --max-concurrency 2 || EVAL_FAILED=true
-
-          cp "reports/redteam-${TIMESTAMP}.html" reports/index.html
-          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
-
-          # Defer the failure so reports are still committed and Pages deployed
-          if [ "$EVAL_FAILED" = "true" ]; then
+            --max-concurrency 2; then
             echo "EVAL_FAILED=true" >> $GITHUB_ENV
           fi
 
+          cp "reports/redteam-${TIMESTAMP}.html" reports/index.html
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+          
       # ── Quality gate summary ────────────────────────────────────────────────
       - name: Parse results for quality gate
         if: always()
