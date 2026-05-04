@@ -199,7 +199,12 @@ jobs:
         if: always()
         uses: actions/deploy-pages@v4
 
-      # ── Job summary ─────────────────────────────────────────────────────────
+      # ── build red team summary from repositoryjavascript ────────────────────
+      - name: Build redteam summary (JS)
+        run: |
+          node .github/scripts/redteam-summary.js --input output.json --out comment.md --print
+          
+      # ── Job summary ─────────────────────────────────────────────────────────          
       - name: Write job summary
         if: always()
         run: |
