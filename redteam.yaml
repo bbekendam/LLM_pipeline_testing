@@ -7,6 +7,7 @@ providers:
     label: github-fast
     config:
       temperature: 0.8  # Increased for more diverse adversarial output
+      safeOnFilter: true
 
 redteam:
   # The purpose guides the generation of the attacks themselves
