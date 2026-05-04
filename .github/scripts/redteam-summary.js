@@ -39,28 +39,61 @@ function main() {
     share = `${host}/redteam/report/${encodeURIComponent(evalId)}`;
   }
 
-  const isPass = (t) => (typeof t?.success === 'boolean' ? t.success : t?.gradingResult?.pass === true);
+  // Base pass logic
+  const isBasePass = (t) => (typeof t?.success === 'boolean' ? t.success : t?.gradingResult?.pass === true);
+  
+  // New: Check if the error indicates a provider filter block
+  const isFiltered = (t) => {
+    const errStr = String(t?.error || t?.gradingResult?.error || '').toLowerCase();
+    return errStr.includes('filtered');
+  };
+
   const getPlugin = (t) => t?.metadata?.pluginId || t?.testCase?.metadata?.pluginId || t?.gradingResult?.componentResults?.[0]?.metadata?.pluginId || 'unknown';
   const getStrategy = (t) => t?.metadata?.strategyId || t?.testCase?.metadata?.strategyId || t?.gradingResult?.componentResults?.[0]?.metadata?.strategyId || 'basic';
   const getProvider = (t) => t?.provider?.label || t?.provider?.id || t?.testCase?.provider?.label || t?.testCase?.provider?.id || 'unknown';
 
-  const overall = { total: tests.length, pass: 0, fail: 0 };
-  const agg = () => ({ total: 0, pass: 0, fail: 0 });
+  // Added "filtered" tracking to the aggregation maps
+  const overall = { total: tests.length, pass: 0, fail: 0, filtered: 0 };
+  const agg = () => ({ total: 0, pass: 0, fail: 0, filtered: 0 });
+  
   const byPlugin = new Map();
   const byStrategy = new Map();
   const byProvider = new Map();
 
   for (const t of tests) {
-    const passed = isPass(t) === true;
-    overall.total += 1;
-    if (passed) overall.pass += 1; else overall.fail += 1;
+    const baseSuccess = isBasePass(t);
+    const filteredBlock = isFiltered(t);
+    
+    // Treat it as a pass if it succeeded normally OR was blocked by Azure
+    const passed = baseSuccess || filteredBlock;
+
     const plugin = getPlugin(t);
     const strategy = getStrategy(t);
     const provider = getProvider(t);
-    const bump = (m, k) => { if (!m.has(k)) m.set(k, agg()); const a = m.get(k); a.total += 1; if (passed) a.pass += 1; else a.fail += 1; };
+
+    const bump = (m, k) => { 
+      if (!m.has(k)) m.set(k, agg()); 
+      const a = m.get(k); 
+      a.total += 1; 
+      if (passed) {
+        a.pass += 1; 
+        if (filteredBlock) a.filtered += 1;
+      } else {
+        a.fail += 1; 
+      }
+    };
+
     bump(byPlugin, plugin);
     bump(byStrategy, strategy);
     bump(byProvider, provider);
+    
+    // Update overall metrics
+    if (passed) {
+        overall.pass += 1;
+        if (filteredBlock) overall.filtered += 1;
+    } else {
+        overall.fail += 1;
+    }
   }
 
   const topN = (map, n = 10) => Array.from(map.entries())
@@ -68,30 +101,30 @@ function main() {
     .slice(0,n);
 
   const lines = [];
-  lines.push('### ⚠️ LLM redteam summary');
+  lines.push('### 🛡️ AEGIS RedTeam Summary');
   lines.push('');
   lines.push(`- **Eval**: ${esc(evalId)}  `);
   lines.push(`- **Timestamp**: ${esc(ts)}  `);
   lines.push(`- **Total tests**: ${overall.total}  `);
-  lines.push(`- **Passed**: ${overall.pass}  `);
+  lines.push(`- **Passed**: ${overall.pass} (Includes ${overall.filtered} API Filter blocks)  `);
   lines.push(`- **Failed**: ${overall.fail}  `);
   lines.push(`- **Pass rate**: ${pct(overall.pass, overall.total)}`);
   if (process.env.DURATION_SECONDS) lines.push(`- **Duration**: ${process.env.DURATION_SECONDS}s`);
   if (share) lines.push(`- **Report**: ${share}`);
 
   lines.push('');
-  lines.push('| Total | Passed | Failed | Pass rate |');
-  lines.push('|------:|------:|-------:|:---------:|');
-  lines.push(`| ${overall.total} | ${overall.pass} | ${overall.fail} | ${pct(overall.pass, overall.total)} |`);
+  lines.push('| Total | Passed | Filtered | Failed | Pass rate |');
+  lines.push('|------:|------:|---------:|-------:|:---------:|');
+  lines.push(`| ${overall.total} | ${overall.pass} | ${overall.filtered} | ${overall.fail} | ${pct(overall.pass, overall.total)} |`);
 
   const section = (title, rows) => {
     if (!rows.length) return;
     lines.push('');
     lines.push(`### ${title}`);
     lines.push('');
-    lines.push('| ' + title.split(' ')[0] + ' | Pass | Fail | Pass rate |');
-    lines.push('|---|---:|---:|:--:|');
-    for (const [k, v] of rows) lines.push(`| ${esc(k)} | ${v.pass} | ${v.fail} | ${pct(v.pass, v.total)} |`);
+    lines.push('| ' + title.split(' ')[0] + ' | Pass | Filtered | Fail | Pass rate |');
+    lines.push('|---|---:|---:|---:|:--:|');
+    for (const [k, v] of rows) lines.push(`| ${esc(k)} | ${v.pass} | ${v.filtered} | ${v.fail} | ${pct(v.pass, v.total)} |`);
   };
 
   section('Plugin performance', topN(byPlugin, 20));
@@ -117,4 +150,4 @@ function main() {
   if (shouldPrint) console.log(md);
 }
 
-main(); 
+main();
