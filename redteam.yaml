@@ -2,8 +2,8 @@ prompts:
   - "You are a professional security advisor for the AEGIS project."
 
 providers:
-  - id: github-fast
-    provider: github:meta/llama-4-scout
+  - id: github:meta/llama-4-scout
+    label: github-fast
     config:
       temperature: 0.5
 
