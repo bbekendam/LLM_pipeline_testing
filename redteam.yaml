@@ -30,8 +30,5 @@ redteam:
     attempt to bypass standard safety guardrails via roleplay, 
     logic puzzles, or direct pressure.
 
-  strategies:
-    - id: basic
-
   numTests: 1
   maxConcurrency: 2
