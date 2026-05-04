@@ -22,7 +22,6 @@ jobs:
 
     env:
       PROMPTFOO_DISABLE_TELEMETRY: 1
-      OLLAMA_HOST: http://127.0.0.1:11434
       MODEL: github:openai/gpt-4o
       GITHUB_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
       NODE_NO_WARNINGS: 1
