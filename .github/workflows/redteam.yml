@@ -20,6 +20,7 @@ jobs:
       PROMPTFOO_DISABLE_TELEMETRY: 1
       OLLAMA_HOST: http://127.0.0.1:11434
       MODEL: github:meta/llama-4-scout
+      GITHUB_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
       NODE_NO_WARNINGS: 1
 
     steps:
